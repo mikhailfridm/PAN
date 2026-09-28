@@ -1,0 +1,10 @@
+# Compiled binaries
+Seminar2/*/main
+Seminar2/*/*.o
+Seminar2/*/*.exe
+Seminar2/*/*.out
+
+# OS / editor junk
+.DS_Store
+.vscode/
+.idea/
