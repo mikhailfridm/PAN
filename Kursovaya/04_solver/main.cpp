@@ -3,6 +3,7 @@
 // Метод: динамическое программирование на сетке (V,H)
 
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <cmath>
 #include <iomanip>
@@ -125,6 +126,8 @@ struct Segment {
     bool feasible;
     double dt;
     double dfuel;
+    double sinTheta;  // синус угла наклона траектории на участке (для разгона = 0)
+    double alpha;     // угол атаки в средней точке участка, град
 };
 
 const double G = 9.80665;
@@ -160,12 +163,14 @@ Segment computeSegment(int type, double V1, double H1, double V2, double H2,
         double excess = P - X;
         if (excess <= 0) return seg;
         seg.dt = MASS * (V2 - V1) / excess;
+        seg.sinTheta = 0.0;
     } else if (type == 1) {
         double excess = P - X;
         if (excess <= 0) return seg;
         double sinTheta = excess / (MASS * G);
         if (sinTheta >= 1.0) return seg;
         seg.dt = (H2 - H1) / (Vm * sinTheta);
+        seg.sinTheta = sinTheta;
     } else {
         double K = (H2 - H1) / (V2 - V1);
         double sinTheta = K * (P - X) / (MASS * (Vm + K * G));
@@ -173,9 +178,11 @@ Segment computeSegment(int type, double V1, double H1, double V2, double H2,
         double excess = P - X - MASS * G * sinTheta;
         if (excess <= 0) return seg;
         seg.dt = MASS * (V2 - V1) / excess;
+        seg.sinTheta = sinTheta;
     }
 
     seg.dfuel = engine.getFuelFlow(Hm, M) * seg.dt;
+    seg.alpha = aero.getAngleOfAttack(Cy);
     seg.feasible = true;
     return seg;
 }
@@ -185,7 +192,7 @@ Segment computeSegment(int type, double V1, double H1, double V2, double H2,
 // найденного оптимального пути от S0 к Sk.
 void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<double> &H,
                     vector<vector<Segment>> &segA, vector<vector<Segment>> &segB,
-                    vector<vector<Segment>> &segC) {
+                    vector<vector<Segment>> &segC, const string &csvFile) {
     int n = (int)V.size() - 1;
     double INF = numeric_limits<double>::infinity();
 
@@ -233,8 +240,12 @@ void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<
          << setw(12) << "t, с" << setw(14) << "топливо, кг" << endl;
 
     int i = 0, j = 0;
-    double totalT = 0, totalFuel = 0;
+    double totalT = 0, totalFuel = 0, totalL = 0;
     string names[3] = {"разгон", "подъем", "подъем-разгон"};
+
+    ofstream csv(csvFile);
+    csv << "V_kmh,H_m,L_m,alpha_deg,t_s,fuel_kg\n";
+    csv << V[i] * 3.6 << "," << H[j] << "," << totalL << ",0," << totalT << "," << totalFuel << "\n";
 
     cout << setw(10) << V[i] * 3.6 << setw(10) << H[j] << setw(14) << "старт"
          << setw(12) << totalT << setw(14) << totalFuel << endl;
@@ -243,6 +254,9 @@ void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<
         int type = dir[i][j];
         Segment seg = (type == 0 ? segA[i][j] : (type == 1 ? segB[i][j] : segC[i][j]));
 
+        double Vm = (V[i] + (type == 1 ? V[i] : V[i + 1])) / 2.0;
+        double cosTheta = sqrt(1.0 - seg.sinTheta * seg.sinTheta);
+        totalL += Vm * cosTheta * seg.dt;
         totalT += seg.dt;
         totalFuel += seg.dfuel;
 
@@ -252,10 +266,13 @@ void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<
 
         cout << setw(10) << V[i] * 3.6 << setw(10) << H[j] << setw(14) << names[type]
              << setw(12) << totalT << setw(14) << totalFuel << endl;
+
+        csv << V[i] * 3.6 << "," << H[j] << "," << totalL << "," << seg.alpha << ","
+            << totalT << "," << totalFuel << "\n";
     }
 
     cout << "\nИтого: время маневра t = " << totalT << " с (" << totalT / 60.0 << " мин), "
-         << "расход топлива = " << totalFuel << " кг" << endl;
+         << "расход топлива = " << totalFuel << " кг, дальность L = " << totalL / 1000.0 << " км" << endl;
 }
 
 int main() {
@@ -288,8 +305,8 @@ int main() {
         }
     }
 
-    solveAndPrint(true, V, H, segA, segB, segC);
-    solveAndPrint(false, V, H, segA, segB, segC);
+    solveAndPrint(true, V, H, segA, segB, segC, "trajectory_fuel.csv");
+    solveAndPrint(false, V, H, segA, segB, segC, "trajectory_time.csv");
 
     return 0;
 }
