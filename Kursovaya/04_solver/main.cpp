@@ -1,3 +1,7 @@
+// Курсовое ДЗ "ПАН": построение оптимальной программной траектории ЛА
+// Вариант 5: самолет МС-21, Max P = 100%, H0=300м/V0=300км/ч -> Hk=6000м/Vk=500км/ч
+// Метод: динамическое программирование на сетке (V,H)
+
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -5,9 +9,16 @@
 #include <limits>
 using namespace std;
 
+// Стандартная атмосфера, ГОСТ 4401-81 (аппроксимация барометрической формулой
+// для тропосферы, H <= 11000 м)
 class Atmosphere {
 private:
-    double T0, p0, g0, L, R, k;
+    double T0;  // температура на уровне моря, К
+    double p0;  // давление на уровне моря, Па
+    double g0;  // ускорение свободного падения, м/с^2
+    double L;   // температурный градиент, К/м
+    double R;   // газовая постоянная воздуха, Дж/(кг*К)
+    double k;   // показатель адиабаты воздуха
 
 public:
     Atmosphere() : T0(288.15), p0(101325.0), g0(9.80665), L(0.0065), R(287.05287), k(1.4) {}
@@ -28,15 +39,27 @@ public:
     }
 };
 
+// Аэродинамика МС-21, крейсерская конфигурация (закрылки убраны).
+// Cy(alpha) - линейная аппроксимация по Рис.3 методички.
+// Cx(Cy) = Cx0 + A*Cy^2 - парабола поляры (Рис.4), коэффициент A подобран так,
+// чтобы максимальное качество Kmax = Cy/Cx совпадало с данным в методичке
+// значением Kmax = 18.1 (Рис.5).
 class Aerodynamics {
 private:
-    double S, Cy0, CyAlpha, CyMax, alphaCrit, Cx0, A;
+    double S;         // площадь крыла, м^2
+    double Cy0;        // коэффициент подъемной силы при alpha = 0
+    double CyAlpha;    // производная Cy по alpha, 1/град
+    double CyMax;      // допустимый максимум Cy (срыв потока)
+    double alphaCrit;  // критический угол атаки, град (крейсерская конфигурация)
+    double Cx0;        // коэффициент сопротивления при Cy = 0
+    double A;          // коэффициент индуктивного сопротивления
 
 public:
     Aerodynamics(double S)
         : S(S), Cy0(0.47), CyAlpha(0.0735), CyMax(1.5), alphaCrit(14.0),
           Cx0(0.0275), A(0.0277) {}
 
+    // Cy, необходимый для создания подъемной силы Y при скорости V на плотности rho
     double getCyFromLift(double Y, double rho, double V) {
         return Y / (0.5 * rho * V * V * S);
     }
@@ -58,17 +81,24 @@ public:
     }
 };
 
+// Силовая установка - 2 х ПД-14.
+// Тяга P(H,M) - кусочно-линейная интерполяция между опорными высотными кривыми
+// H=0, H=5000 и H=10000 м (Рис.6 методички), каждая кривая линейна по M.
+// Удельный расход Ср взят типовым для ПД-14 (в методичке для МС-21 не дан).
 class Engine {
 private:
-    double Cp, maxPPercent, g0;
+    double Cp;           // удельный расход топлива, кг топл./(кгс*ч)
+    double maxPPercent;  // процент тяги от номинала по варианту задания
+    double g0;
 
 public:
     Engine(double maxPPercent) : Cp(0.555), maxPPercent(maxPPercent), g0(9.80665) {}
 
+    // суммарная тяга двух двигателей, кгс
     double getThrustKgf(double H, double M) {
-        double P0 = 26000.0 - 20000.0 * M;
-        double P5 = 13667.0 - 6667.0 * M;
-        double P10 = 6200.0 - 800.0 * M;
+        double P0 = 26000.0 - 20000.0 * M;   // опорная кривая H = 0
+        double P5 = 13667.0 - 6667.0 * M;    // опорная кривая H = 5000 м
+        double P10 = 6200.0 - 800.0 * M;     // опорная кривая H = 10000 м
 
         double P;
         if (H <= 5000.0) {
@@ -83,11 +113,14 @@ public:
         return getThrustKgf(H, M) * g0;
     }
 
+    // расход топлива, кг/с (dm/dt = -P*Cp/3600 из уравнения математической модели)
     double getFuelFlow(double H, double M) {
         return getThrustKgf(H, M) * Cp / 3600.0;
     }
 };
 
+// Результат расчета одной элементарной траектории: время и расход топлива
+// на переход из одного узла сетки в соседний.
 struct Segment {
     bool feasible;
     double dt;
@@ -95,9 +128,18 @@ struct Segment {
 };
 
 const double G = 9.80665;
-const double MASS = 70000.0;
+const double MASS = 70000.0;  // взлетная масса МС-21, кг (принята постоянной в пределах маневра)
 
-// type: 0 = разгон (H const), 1 = подъем (V const), 2 = подъем-разгон (диагональ)
+// Расчет элементарной траектории между узлами (V1,H1) и (V2,H2).
+// Параметры (rho, M, P, X) берутся в средней точке участка - по методичке
+// шаг сетки выбирается так, чтобы внутри элементарной подобласти эти величины
+// менялись незначительно.
+// Подъемная сила принята равной весу (Y = m*g, cos(Theta) ~= 1) - упрощение,
+// обычное для малых углов наклона траектории.
+//
+// type 0 "разгон"       (H = const, Theta = 0):      m*dV/dt = P - X
+// type 1 "подъем"       (V = const, dV/dt = 0):       sin(Theta) = (P-X)/(m*g)
+// type 2 "подъем-разгон" (Theta = const, dH/dV = K):   sin(Theta) = K*(P-X)/(m*(V+K*g))
 Segment computeSegment(int type, double V1, double H1, double V2, double H2,
                         Atmosphere &atm, Aerodynamics &aero, Engine &engine) {
     Segment seg;
@@ -138,16 +180,21 @@ Segment computeSegment(int type, double V1, double H1, double V2, double H2,
     return seg;
 }
 
+// Метод динамического программирования: обратный проход от конечной точки Sk
+// к начальной S0 (принцип оптимальности Беллмана), затем прямая трассировка
+// найденного оптимального пути от S0 к Sk.
 void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<double> &H,
                     vector<vector<Segment>> &segA, vector<vector<Segment>> &segB,
                     vector<vector<Segment>> &segC) {
     int n = (int)V.size() - 1;
     double INF = numeric_limits<double>::infinity();
 
-    vector<vector<double>> J(n + 1, vector<double>(n + 1, INF));
-    vector<vector<int>> dir(n + 1, vector<int>(n + 1, -1));
+    vector<vector<double>> J(n + 1, vector<double>(n + 1, INF));  // минимальная стоимость пути из узла до Sk
+    vector<vector<int>> dir(n + 1, vector<int>(n + 1, -1));       // оптимальный тип участка из узла
     J[n][n] = 0.0;
 
+    // обходим узлы по убыванию диагонали (i+j), чтобы к моменту расчета узла
+    // (i,j) все узлы, в которые из него можно попасть, были уже обработаны
     for (int s = 2 * n - 1; s >= 0; s--) {
         int iMin = max(0, s - n);
         int iMax = min(n, s);
@@ -212,11 +259,12 @@ void solveAndPrint(bool useFuelCriterion, const vector<double> &V, const vector<
 }
 
 int main() {
+    // исходные данные варианта 5
     double V0 = 300.0 / 3.6;
     double Vk = 500.0 / 3.6;
     double H0 = 300.0;
     double Hk = 6000.0;
-    int n = 10;
+    int n = 20;  // число шагов сетки по V и по H
 
     vector<double> V(n + 1), H(n + 1);
     for (int i = 0; i <= n; i++) V[i] = V0 + (Vk - V0) * i / n;
@@ -226,6 +274,8 @@ int main() {
     Aerodynamics aero(113.0);
     Engine engine(100.0);
 
+    // веса (стоимости) элементарных траекторий трех типов для всех узлов сетки:
+    // segA - "разгон", segB - "подъем", segC - "подъем-разгон"
     vector<vector<Segment>> segA(n + 1, vector<Segment>(n + 1));
     vector<vector<Segment>> segB(n + 1, vector<Segment>(n + 1));
     vector<vector<Segment>> segC(n + 1, vector<Segment>(n + 1));
